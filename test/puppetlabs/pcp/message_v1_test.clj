@@ -1,6 +1,6 @@
-(ns puppetlabs.pcp.message-test
+(ns puppetlabs.pcp.message-v1-test
   (:require [clojure.test :refer :all]
-            [puppetlabs.pcp.message :refer :all]
+            [puppetlabs.pcp.message-v1 :refer :all]
             [slingshot.test]
             [schema.core :as s]
             [schema.test :as st]))
@@ -104,18 +104,18 @@
 
 (deftest decode-test
   (testing "it only handles version 1 messages"
-    (is (thrown+? [:type :puppetlabs.pcp.message/message-malformed]
+    (is (thrown+? [:type :puppetlabs.pcp.message-v1/message-malformed]
                   (decode (byte-array [2])))))
   (testing "it insists on envelope chunk first"
-    (is (thrown+? [:type :puppetlabs.pcp.message/message-invalid]
+    (is (thrown+? [:type :puppetlabs.pcp.message-v1/message-invalid]
                   (decode (byte-array [1,
                                        2, 0 0 0 2, 123 125])))))
   (testing "it insists on a well-formed envelope"
-    (is (thrown+? [:type :puppetlabs.pcp.message/envelope-malformed]
+    (is (thrown+? [:type :puppetlabs.pcp.message-v1/envelope-malformed]
                   (decode (byte-array [1,
                                        1, 0 0 0 1, 123])))))
   (testing "it insists on a complete envelope"
-    (is (thrown+? [:type :puppetlabs.pcp.message/envelope-invalid]
+    (is (thrown+? [:type :puppetlabs.pcp.message-v1/envelope-invalid]
                   (decode (byte-array [1,
                                        1, 0 0 0 2, 123 125])))))
   ;; disable schema validations (both signature validations and explicit

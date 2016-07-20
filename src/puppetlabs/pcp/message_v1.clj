@@ -1,10 +1,10 @@
-(ns puppetlabs.pcp.message
+(ns puppetlabs.pcp.message-v1
   (:require [org.clojars.smee.binary.core :as b]
             [cheshire.core :as cheshire]
             [clj-time.core :as t]
             [clj-time.format :as tf]
             [puppetlabs.kitchensink.core :as ks]
-            [puppetlabs.pcp.protocol :refer [Envelope ISO8601]]
+            [puppetlabs.pcp.protocol-v1 :refer [Envelope ISO8601]]
             [schema.core :as s]
             [slingshot.slingshot :refer [try+ throw+]]
             [puppetlabs.i18n.core :as i18n]))
@@ -45,11 +45,6 @@
   map to an envelope schema."
   [message :- Message]
   (dissoc message :_chunks))
-
-(defn filter-private
-  "Deprecated, use message->envelope if you need"
-  {:deprecated "0.2.0"}
-  [message] (message->envelope message))
 
 (s/defn set-expiry :- Message
   "Returns a message with new expiry"
@@ -164,24 +159,28 @@
    :version (b/constant :byte 1)
    :chunks (b/repeated chunk-codec)))
 
-(s/defn encode :- ByteArray
-  [message :- Message]
+(s/defn encode-impl :- ByteArray
+  [message :- Message msg->env msg-codec]
   (let [stream (java.io.ByteArrayOutputStream.)
-        envelope (string->bytes (cheshire/generate-string (message->envelope message)))
+        envelope (string->bytes (cheshire/generate-string (msg->env message)))
         chunks (into []
                      (remove nil? [{:descriptor {:type 1}
                                     :data envelope}
                                    (get-in message [:_chunks :data])
                                    (get-in message [:_chunks :debug])]))]
-    (b/encode message-codec stream {:chunks chunks})
+    (b/encode msg-codec stream {:chunks chunks})
     (.toByteArray stream)))
 
-(s/defn decode :- Message
+(s/defn encode :- ByteArray
+  [message :- Message]
+  (encode-impl message message->envelope message-codec))
+
+(s/defn decode-impl :- Message
   "Returns a message object from a network format message"
-  [bytes :- ByteArray]
+  [bytes :- ByteArray envelope-type make-msg msg-codec]
   (let [stream (java.io.ByteArrayInputStream. bytes)
         decoded (try+
-                  (b/decode message-codec stream)
+                  (b/decode msg-codec stream)
                   (catch Throwable _
                     (throw+ {:type ::message-malformed
                              :message (:message &throw-context)})))]
@@ -197,13 +196,17 @@
           data-chunk (second (:chunks decoded))
           data-frame (or (:data data-chunk) (byte-array 0))
           data-flags (or (get-in data-chunk [:descriptor :flags]) #{})]
-      (try+ (s/validate Envelope envelope)
+      (try+ (s/validate envelope-type envelope)
             (catch Object _
               (throw+ {:type ::envelope-invalid
                        :message (:message &throw-context)})))
-      (let [message (set-data (merge (make-message) envelope) data-frame data-flags)]
+      (let [message (set-data (merge (make-msg) envelope) data-frame data-flags)]
         (if-let [debug-chunk (get (:chunks decoded) 2)]
           (let [debug-frame (or (:data debug-chunk) (byte-array 0))
                 debug-flags (or (get-in debug-chunk [:descriptor :flags]) #{})]
             (set-debug message debug-frame debug-flags))
           message)))))
+
+(s/defn decode :- Message
+  [bytes :- ByteArray]
+  (decode-impl bytes Envelope make-message message-codec))
