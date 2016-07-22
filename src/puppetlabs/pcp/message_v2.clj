@@ -1,80 +1,239 @@
 (ns puppetlabs.pcp.message-v2
   (:require [org.clojars.smee.binary.core :as b]
-            [puppetlabs.pcp.message-v1 :as v1]
+            [cheshire.core :as cheshire]
+            [clj-time.core :as t]
+            [clj-time.format :as tf]
+            [puppetlabs.kitchensink.core :as ks]
             [puppetlabs.pcp.protocol-v2 :refer [Envelope ISO8601]]
-            [schema.core :as s]))
+            [schema.core :as s]
+            [slingshot.slingshot :refer [try+ throw+]]
+            [puppetlabs.i18n.core :as i18n]
+            [puppetlabs.pcp.message-v1 :as v1]))
 
+;; schemas for message validation
 (def Message
-  "Defines a v2 message object"
+  "Defines the message objects we're using"
+  ;; NOTE(richardc) the overriding of :sender here is a bit janky, we
+  ;; accept that we can have anything in memory, but we'll check the
+  ;; Envelope schema when interacting with the network
   (merge Envelope
          {:sender s/Str
           :_chunks {s/Keyword s/Any}}))
 
-(s/defn v2->v1 :- v1/Message
-  "Convert v2 message to v1: strip in-reply-to for everything but inventory_response"
-  [message :- Message]
+(def ByteArray
+  "Schema for a byte-array"
+  (class (byte-array 0)))
+
+(def FlagSet
+  "Schema for the message flags"
+  #{s/Keyword})
+
+;; conversion with v1 messages
+(s/defn ^:private remove-in-reply-to
+  [message]
   (if (= "http://puppetlabs.com/inventory_response" (:message_type message))
     message
     (dissoc message :in-reply-to)))
 
+(s/defn ^:private ttl->expiry
+  [message]
+  (let [ttl (:ttl message)
+        expiry (if (pos? ttl) (-> ttl t/millis t/from-now) (t/now))
+        expires (tf/unparse (tf/formatters :date-time) expiry)]
+    (assoc (dissoc message :ttl) :expires expires)))
+
+(s/defn v2->v1 :- v1/Message
+  "Convert v2 message to v1: strip in-reply-to for everything but inventory_response"
+  [message :- Message]
+  (-> message
+      (remove-in-reply-to)
+      (ttl->expiry)))
+
+(s/defn ^:private expiry->ttl
+  [message]
+  (let [expiry (tf/parse (tf/formatters :date-time) (:expires message))
+        now (t/now)
+        ttl (if (t/before? now expiry)
+              ;; round to nearest integer
+              (t/in-millis (t/interval now expiry))
+              0)]
+    (assoc (dissoc message :expires) :ttl ttl)))
+
 (s/defn v1->v2 :- Message
   [message :- v1/Message]
-  message)
+  (-> message
+      (expiry->ttl)))
 
-(def ByteArray v1/ByteArray)
+;; string<->byte-array utilities
 
-(def FlagSet v1/FlagSet)
+(defn string->bytes
+  "Returns an array of bytes from a string"
+  [s]
+  (byte-array (map byte s)))
 
-(def string->bytes v1/string->bytes)
+(defn bytes->string
+  "Returns a string given a byte-array"
+  [bytes]
+  (String. bytes))
 
-(def bytes->string v1/bytes->string)
+;; abstract message manipulation
+(s/defn message->envelope :- Envelope
+  "Returns the map without any of the known 'private' keys.  Should
+  map to an envelope schema."
+  [message :- Message]
+  (dissoc message :_chunks))
 
-(def message->envelope v1/message->envelope)
+(s/defn set-expiry :- Message
+  "Returns a message with new expiry"
+  [message :- Message number :- s/Int unit :- s/Keyword]
+  (let [ttl (condp = unit
+              :millis number
+              :seconds (* 1000 number)
+              :hours (* 60 60 1000 number)
+              :days (* 24 60 60 1000 number))]
+    (assoc message :ttl ttl)))
 
-(def set-expiry v1/set-expiry)
+(s/defn get-data :- ByteArray
+  "Returns the data from the data frame"
+  [message :- Message]
+  (get-in message [:_chunks :data :data] (byte-array 0)))
 
-(def get-data v1/get-data)
+(s/defn get-debug :- ByteArray
+  "Returns the data from the debug frame"
+  [message :- Message]
+  (get-in message [:_chunks :debug :data] (byte-array 0)))
 
-(def get-debug v1/get-debug)
+(s/defn set-data :- Message
+  "Sets the data for the data frame"
+  ([message :- Message data :- ByteArray] (set-data message data #{}))
+  ([message :- Message data :- ByteArray flags :- FlagSet]
+   (assoc-in message [:_chunks :data] {:descriptor {:type 2
+                                                    :flags flags}
+                                       :data data})))
 
-(def set-data v1/set-data)
+(s/defn set-debug :- Message
+  "Sets the data for the debug frame"
+  ([message :- Message data :- ByteArray] (set-debug message data #{}))
+  ([message :- Message data :- ByteArray flags :- FlagSet]
+   (assoc-in message [:_chunks :debug] {:descriptor {:type 3
+                                                     :flags flags}
+                                        :data data})))
 
-(def set-debug v1/set-debug)
+(s/defn get-json-data :- s/Any
+  "Returns the data from the data frame decoded from json"
+  [message :- Message]
+  (let [data (get-data message)
+        decoded (cheshire/parse-string (bytes->string data) true)]
+    decoded))
 
-(def get-json-data v1/get-json-data)
+(s/defn get-json-debug :- s/Any
+  "Returns the data from the debug frame decoded from json"
+  [message :- Message]
+  (let [data (get-debug message)
+        decoded (cheshire/parse-string (bytes->string data) true)]
+    decoded))
 
-(def get-json-debug v1/get-json-debug)
+(s/defn set-json-data :- Message
+  "Sets the data to be the json byte-array version of data"
+  [message :- Message data :- s/Any]
+  (set-data message (string->bytes (cheshire/generate-string data))))
 
-(def set-json-data v1/set-json-data)
+(s/defn set-json-debug :- Message
+  "Sets the debug data to be the json byte-array version of data"
+  [message :- Message data :- s/Any]
+  (set-debug message (string->bytes (cheshire/generate-string data))))
 
-(def set-json-debug v1/set-json-debug)
+(s/defn make-message :- Message
+  "Returns a new empty message structure"
+  [& args]
+  (let [message (into {:id (ks/uuid)
+                       :targets []
+                       :message_type ""
+                       :sender ""
+                       :ttl 0
+                       :_chunks {}}
+                      (apply hash-map args))]
+    (set-data message (byte-array 0))))
 
-(def make-message v1/make-message)
+;; message encoding/codecs
 
-(def flag-bits v1/flag-bits)
+(def flag-bits
+  {2r1000 :unused1
+   2r0100 :unused2
+   2r0010 :unused3
+   2r0001 :unused4})
 
-(def encode-descriptor v1/encode-descriptor)
+(defn encode-descriptor
+  "Returns a binary representation of a chunk descriptor"
+  [type]
+  (let [type-bits (:type type)
+        flag-set  (:flags type)
+        flags (apply bit-or 0 0 (remove nil? (map (fn [[mask name]] (if (contains? flag-set name) mask)) flag-bits)))
+        byte (bit-or type-bits (bit-shift-left flags 4))]
+    byte))
 
-(def decode-descriptor v1/decode-descriptor)
+(defn decode-descriptor
+  "Returns the clojure object for a chunk descriptor from a byte"
+  [byte]
+  (let [type (bit-and 0x0F byte)
+        flags (bit-shift-right (bit-and 0xF0 byte) 4)
+        flag-set (into #{} (remove nil? (map (fn [[mask name]] (if (= mask (bit-and mask flags)) name)) flag-bits)))]
+    {:flags flag-set
+     :type type}))
 
-(def descriptor-codec v1/descriptor-codec)
+(def descriptor-codec
+  (b/compile-codec :byte encode-descriptor decode-descriptor))
 
-(def chunk-codec v1/chunk-codec)
+(def chunk-codec
+  (b/ordered-map
+   :descriptor descriptor-codec
+   :data (b/blob :prefix :int-be)))
 
 (def message-codec
   (b/ordered-map
     :version (b/constant :byte 2)
     :chunks (b/repeated chunk-codec)))
 
-(def encode-impl v1/encode-impl)
-
 (s/defn encode :- ByteArray
   [message :- Message]
-  (encode-impl message message->envelope message-codec))
-
-(def decode-impl v1/decode-impl)
+  (let [stream (java.io.ByteArrayOutputStream.)
+        envelope (string->bytes (cheshire/generate-string (message->envelope message)))
+        chunks (into []
+                     (remove nil? [{:descriptor {:type 1}
+                                    :data envelope}
+                                   (get-in message [:_chunks :data])
+                                   (get-in message [:_chunks :debug])]))]
+    (b/encode message-codec stream {:chunks chunks})
+    (.toByteArray stream)))
 
 (s/defn decode :- Message
+  "Returns a message object from a network format message"
   [bytes :- ByteArray]
-  (decode-impl bytes Envelope make-message message-codec))
-
+  (let [stream (java.io.ByteArrayInputStream. bytes)
+        decoded (try+
+                  (b/decode message-codec stream)
+                  (catch Throwable _
+                    (throw+ {:type ::message-malformed
+                             :message (:message &throw-context)})))]
+    (if (not (= 1 (get-in (first (:chunks decoded)) [:descriptor :type])))
+      (throw+ {:type ::message-invalid
+               :message (i18n/trs "first chunk should be type 1")}))
+    (let [envelope-json (bytes->string (:data (first (:chunks decoded))))
+          envelope (try+
+                     (cheshire/decode envelope-json true)
+                     (catch Exception _
+                       (throw+ {:type ::envelope-malformed
+                                :message (:message &throw-context)})))
+          data-chunk (second (:chunks decoded))
+          data-frame (or (:data data-chunk) (byte-array 0))
+          data-flags (or (get-in data-chunk [:descriptor :flags]) #{})]
+      (try+ (s/validate Envelope envelope)
+            (catch Object _
+              (throw+ {:type ::envelope-invalid
+                       :message (:message &throw-context)})))
+      (let [message (set-data (merge (make-message) envelope) data-frame data-flags)]
+        (if-let [debug-chunk (get (:chunks decoded) 2)]
+          (let [debug-frame (or (:data debug-chunk) (byte-array 0))
+                debug-flags (or (get-in debug-chunk [:descriptor :flags]) #{})]
+            (set-debug message debug-frame debug-flags))
+          message)))))

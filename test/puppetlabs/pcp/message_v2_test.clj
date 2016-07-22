@@ -1,6 +1,9 @@
 (ns puppetlabs.pcp.message-v2-test
   (:require [clojure.test :refer :all]
+            [clj-time.core :as t]
+            [clj-time.format :as tf]
             [puppetlabs.pcp.message-v2 :refer :all]
+            [puppetlabs.pcp.message-v1 :as v1]
             [slingshot.test]
             [schema.core :as s]
             [schema.test :as st]))
@@ -11,7 +14,7 @@
   (testing "it makes a message"
     (is (= {:sender ""
             :targets []
-            :expires "1970-01-01T00:00:00.000Z"
+            :ttl 0
             :message_type ""}
            (dissoc (make-message) :_chunks :id))))
   (testing "it makes a message with parameters"
@@ -19,18 +22,19 @@
                                 :targets ["pcp:///server"])]
       (is (= {:sender "pcp://client01.example.com/test"
               :targets ["pcp:///server"]
-              :expires "1970-01-01T00:00:00.000Z"
+              :ttl 0
               :message_type ""}
              (dissoc message :_chunks :id))))))
 
 (deftest set-expiry-test
-  (testing "it sets expiries to what you tell it"
-    (is (= (:expires (set-expiry (make-message) "1971-01-01T00:00:00.000Z")) "1971-01-01T00:00:00.000Z")))
-  (testing "it supports relative time"
-    ;; Hello future test debugger.  At one point someone said "we
-    ;; should never be 3 seconds before the epoch".  Past test writer
-    ;; needs a slap.
-    (is (not (= (:expires (set-expiry (make-message) 3 :seconds)) "1970-01-01T00:00:00.000Z")))))
+  (testing "it supports a ttl"
+    (is (= (:ttl (set-expiry (make-message) 3 :seconds)) 3000)))
+  (testing "it converts hours to ttl in milliseconds"
+    (is (= (:ttl (set-expiry (make-message) 1 :hours)) 3600000)))
+  (testing "it converts days to ttl in milliseconds"
+    (is (= (:ttl (set-expiry (make-message) 2 :days)) 172800000)))
+  (testing "it handles very long intervals"
+    (is (= (:ttl (set-expiry (make-message) 365000 :days)) 31536000000000))))
 
 (deftest get-data-test
   (testing "it returns data from the data frame"
@@ -104,18 +108,18 @@
 
 (deftest decode-test
   (testing "it only handles version 2 messages"
-    (is (thrown+? [:type :puppetlabs.pcp.message-v1/message-malformed]
+    (is (thrown+? [:type :puppetlabs.pcp.message-v2/message-malformed]
                   (decode (byte-array [1])))))
   (testing "it insists on envelope chunk first"
-    (is (thrown+? [:type :puppetlabs.pcp.message-v1/message-invalid]
+    (is (thrown+? [:type :puppetlabs.pcp.message-v2/message-invalid]
                   (decode (byte-array [2,
                                        2, 0 0 0 2, 123 125])))))
   (testing "it insists on a well-formed envelope"
-    (is (thrown+? [:type :puppetlabs.pcp.message-v1/envelope-malformed]
+    (is (thrown+? [:type :puppetlabs.pcp.message-v2/envelope-malformed]
                   (decode (byte-array [2,
                                        1, 0 0 0 1, 123])))))
   (testing "it insists on a complete envelope"
-    (is (thrown+? [:type :puppetlabs.pcp.message-v1/envelope-invalid]
+    (is (thrown+? [:type :puppetlabs.pcp.message-v2/envelope-invalid]
                   (decode (byte-array [2,
                                        1, 0 0 0 2, 123 125])))))
   ;; disable schema validations (both signature validations and explicit
@@ -142,7 +146,37 @@
 (deftest encoder-roundtrip-test
   (testing "it can roundtrip data"
     (let [data (byte-array (map byte "hola"))
-          encoded (encode (set-data (make-message :sender "pcp://client01.example.com/test") data))
+          encoded (encode (set-data (make-message :sender "pcp://client01.example.com/test" :ttl 31536000000000) data))
           decoded (decode encoded)]
       (is (= (vec (get-data decoded))
              (vec data))))))
+
+(defn parse [message]
+  (tf/parse (tf/formatters :date-time) (:expires message)))
+
+(deftest codec-roundtrip-test
+  (testing "It can roundtrip from v2->v1->v2"
+    (let [message (make-message :sender "pcp://client01.example.com/test"
+                                :targets ["pcp:///server"])]
+      (is (= message (-> message v2->v1 v1->v2)))))
+  (testing "It can roundtrip from v1->v2->v1 when expiration is in the future"
+    (let [message (-> (v1/make-message :sender "pcp://client01.example.com/test"
+                                       :targets ["pcp:///server"])
+                      (v1/set-expiry 5 :seconds))
+          roundtrip (-> message v1->v2 v2->v1)]
+      (is (= (dissoc message :expires) (dissoc roundtrip :expires)))
+      (is (> 100 (t/in-millis (t/interval (parse message) (parse roundtrip)))))))
+  (testing "It can roundtrip from v1->v2->v1 when expiration is now"
+    (let [message (-> (v1/make-message :sender "pcp://client01.example.com/test"
+                                       :targets ["pcp:///server"])
+                      (v1/set-expiry 0 :seconds))
+          roundtrip (-> message v1->v2 v2->v1)]
+      (is (= (dissoc message :expires) (dissoc roundtrip :expires)))
+      (is (> 100 (t/in-millis (t/interval (parse message) (parse roundtrip)))))))
+  (testing "It can roundtrip from v1->v2->v1 when expiration is in the past"
+    (let [message (v1/make-message :sender "pcp://client01.example.com/test"
+                                   :targets ["pcp:///server"])
+          roundtrip (-> message v1->v2 v2->v1)]
+      (is (= (dissoc message :expires) (dissoc roundtrip :expires)))
+      ;; expiration set to now rather than a past event
+      (is (> 100 (t/in-millis (t/interval (parse roundtrip) (t/now))))))))
